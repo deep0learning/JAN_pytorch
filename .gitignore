@@ -106,3 +106,5 @@ models/resnet50.pth
 .idea
 
 checkpoints
+
+results/*
