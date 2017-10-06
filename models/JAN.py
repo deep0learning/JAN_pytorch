@@ -77,12 +77,13 @@ class Net(nn.Module):
         return y, x
 
 
-def train_val(source_loader, target_loader, val_loader, model, criterion, optimizer, args):
+def train_val(source_loader, target_loader, val_loader, model, optimizer, args):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
-    entropy_loss = AverageMeter()
+
+    criterion = nn.CrossEntropyLoss().cuda()
 
     source_cycle = iter(source_loader)
     target_cycle = iter(target_loader)
@@ -152,7 +153,6 @@ def train_val(source_loader, target_loader, val_loader, model, criterion, optimi
             data_time.reset()
             losses.reset()
             top1.reset()
-
 
 
 def validate(val_loader, model, criterion, args):

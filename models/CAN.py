@@ -1,383 +1,170 @@
-import argparse
-import pdb
-import os
-import shutil
 import time
-import itertools
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.backends.cudnn as cudnn
-import torch.optim
-import torch.utils.data
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-import torchvision.models as models
+import itertools
+from torch.autograd import Variable
+from torchvision import transforms
+from . import cycle_gan
+import numpy as np
 
-import math
-
-from losses import *
 from utils import *
 
-global_iter = 0
-
-
-class GRLayer(torch.autograd.Function):
-    def __init__(self, max_iter=2000, alpha=10., high=1.):
-        super(GRLayer, self).__init__()
-        self.total = float(max_iter)
-        self.alpha = alpha
-        self.high = high
-
-    def forward(self, input):
-        return input.view_as(input)
-
-    def backward(self, gradOutput):
-        prog = global_iter / self.total
-        lr = 2.*self.high / (1 + math.exp(-self.alpha * prog)) - self.high
-        return (-lr) * gradOutput
-
-
-class Generator(nn.Module):
-    def __init__(self, input_nc, output_nc, ngf):
-        super(Generator,self).__init__()
-        self.conv1 = nn.Conv2d(input_nc, ngf, 4, 2, 1)
-        self.conv2 = nn.Conv2d(ngf, ngf * 2, 4, 2, 1)
-        self.conv3 = nn.Conv2d(ngf * 2, ngf * 4, 4, 2, 1)
-        self.conv4 = nn.Conv2d(ngf * 4, ngf * 8, 4, 2, 1)
-        self.conv5 = nn.Conv2d(ngf * 8, ngf * 8, 4, 2, 1)
-        self.conv6 = nn.Conv2d(ngf * 8, ngf * 8, 4, 2, 1)
-        self.conv7 = nn.Conv2d(ngf * 8, ngf * 8, 4, 2, 1)
-        self.conv8 = nn.Conv2d(ngf * 8, ngf * 8, 4, 2, 1)
-        self.dconv1 = nn.ConvTranspose2d(ngf * 8, ngf * 8, 4, 2, 1)
-        self.dconv2 = nn.ConvTranspose2d(ngf * 8 * 2, ngf * 8, 4, 2, 1)
-        self.dconv3 = nn.ConvTranspose2d(ngf * 8 * 2, ngf * 8, 4, 2, 1)
-        self.dconv4 = nn.ConvTranspose2d(ngf * 8 * 2, ngf * 8, 4, 2, 1)
-        self.dconv5 = nn.ConvTranspose2d(ngf * 8 * 2, ngf * 4, 4, 2, 1)
-        self.dconv6 = nn.ConvTranspose2d(ngf * 4 * 2, ngf * 2, 4, 2, 1)
-        self.dconv7 = nn.ConvTranspose2d(ngf * 2 * 2, ngf, 4, 2, 1)
-        self.dconv8 = nn.ConvTranspose2d(ngf * 2, output_nc, 4, 2, 1)
-
-        self.batch_norm = nn.BatchNorm2d(ngf)
-        self.batch_norm2 = nn.BatchNorm2d(ngf * 2)
-        self.batch_norm4 = nn.BatchNorm2d(ngf * 4)
-        self.batch_norm8 = nn.BatchNorm2d(ngf * 8)
-
-        self.leaky_relu = nn.LeakyReLU(0.2, True)
-        self.relu = nn.ReLU(True)
-        self.dropout = nn.Dropout(0.5)
-        self.tanh = nn.Tanh()
-
-    def forward(self, input):
-        # Encoder
-        # Convolution layers:
-        # input is (nc) x 256 x 256
-        e1 = self.conv1(input)
-        # state size is (ngf) x 128 x 128
-        e2 = self.batch_norm2(self.conv2(self.leaky_relu(e1)))
-        # state size is (ngf x 2) x 64 x 64
-        e3 = self.batch_norm4(self.conv3(self.leaky_relu(e2)))
-        # state size is (ngf x 4) x 32 x 32
-        e4 = self.batch_norm8(self.conv4(self.leaky_relu(e3)))
-        # state size is (ngf x 8) x 16 x 16
-        e5 = self.batch_norm8(self.conv5(self.leaky_relu(e4)))
-        # state size is (ngf x 8) x 8 x 8
-        e6 = self.batch_norm8(self.conv6(self.leaky_relu(e5)))
-        # state size is (ngf x 8) x 4 x 4
-        e7 = self.batch_norm8(self.conv7(self.leaky_relu(e6)))
-        # state size is (ngf x 8) x 2 x 2
-        # No batch norm on output of Encoder
-        e8 = self.conv8(self.leaky_relu(e7))
-
-        # Decoder
-        # Deconvolution layers:
-        # state size is (ngf x 8) x 1 x 1
-        d1_ = self.dropout(self.batch_norm8(self.dconv1(self.relu(e8))))
-        # state size is (ngf x 8) x 2 x 2
-        d1 = torch.cat((d1_, e7), 1)
-        d2_ = self.dropout(self.batch_norm8(self.dconv2(self.relu(d1))))
-        # state size is (ngf x 8) x 4 x 4
-        d2 = torch.cat((d2_, e6), 1)
-        d3_ = self.dropout(self.batch_norm8(self.dconv3(self.relu(d2))))
-        # state size is (ngf x 8) x 8 x 8
-        d3 = torch.cat((d3_, e5), 1)
-        d4_ = self.batch_norm8(self.dconv4(self.relu(d3)))
-        # state size is (ngf x 8) x 16 x 16
-        d4 = torch.cat((d4_, e4), 1)
-        d5_ = self.batch_norm4(self.dconv5(self.relu(d4)))
-        # state size is (ngf x 4) x 32 x 32
-        d5 = torch.cat((d5_, e3), 1)
-        d6_ = self.batch_norm2(self.dconv6(self.relu(d5)))
-        # state size is (ngf x 2) x 64 x 64
-        d6 = torch.cat((d6_, e2), 1)
-        d7_ = self.batch_norm(self.dconv7(self.relu(d6)))
-        # state size is (ngf) x 128 x 128
-        d7 = torch.cat((d7_, e1), 1)
-        d8 = self.dconv8(self.relu(d7))
-        # state size is (nc) x 256 x 256
-        output = self.tanh(d8)
-        return output
-
-
-class Discriminator(nn.Module):
-    def __init__(self,input_nc,output_nc,ndf):
-        super(Discriminator,self).__init__()
-        # 256 x 256
-        self.layer1 = nn.Sequential(nn.Conv2d(input_nc+output_nc,ndf,kernel_size=4,stride=2,padding=1),
-                                 nn.LeakyReLU(0.2,inplace=True))
-        # 128 x 128
-        self.layer2 = nn.Sequential(nn.Conv2d(ndf,ndf*2,kernel_size=4,stride=2,padding=1),
-                                 nn.BatchNorm2d(ndf*2),
-                                 nn.LeakyReLU(0.2,inplace=True))
-        # 64 x 64
-        self.layer3 = nn.Sequential(nn.Conv2d(ndf*2,ndf*4,kernel_size=4,stride=2,padding=1),
-                                 nn.BatchNorm2d(ndf*4),
-                                 nn.LeakyReLU(0.2,inplace=True))
-        # 32 x 32
-        self.layer4 = nn.Sequential(nn.Conv2d(ndf*4,ndf*8,kernel_size=4,stride=1,padding=1),
-                                 nn.BatchNorm2d(ndf*8),
-                                 nn.LeakyReLU(0.2,inplace=True))
-        # 31 x 31
-        self.layer5 = nn.Sequential(nn.Conv2d(ndf*8,1,kernel_size=4,stride=1,padding=1),
-                                 nn.Sigmoid())
-
-    def forward(self,x):
-        out = self.layer1(x)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-        out = self.layer5(out)
-        return out
+origin_mean = Variable(torch.Tensor([0.5, 0.5, 0.5])).view(-1, 1, 1).cuda()
+origin_std = Variable(torch.Tensor([0.5, 0.5, 0.5])).view(-1, 1, 1).cuda()
+new_mean = Variable(torch.Tensor([0.485, 0.456, 0.406])).view(-1, 1, 1).cuda()
+new_std = Variable(torch.Tensor([0.229, 0.224, 0.225])).view(-1, 1, 1).cuda()
 
 
 class Net(nn.Module):
     def __init__(self, args):
         super(Net, self).__init__()
-        # create model
-        if args.fromcaffe:
-            print("=> using pre-trained model from caffe '{}'".format(args.arch))
-            import models.caffe_resnet as resnet
-            model = resnet.__dict__[args.arch]()
-            state_dict = torch.load("models/"+args.arch+".pth")
-            model.load_state_dict(state_dict)
-        elif args.pretrained:
-            print("=> using pre-trained model '{}'".format(args.arch))
-            model = models.__dict__[args.arch](pretrained=True)
-        else:
-            print("=> creating model '{}'".format(args.arch))
-            model = models.__dict__[args.arch]()
+        self.optimizer = None
+        self.normalize = transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
 
-        if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
-            self.feature_dim = model.classifier[6].in_features
-            model.classifier = nn.Sequential(*list(model.classifier.children())[:-1])
-        elif args.arch.startswith('densenet'):
-            self.feature_dim = model.classifier.in_features
-            model = nn.Sequential(*list(model.children())[:-1])
-        else:
-            self.feature_dim = model.fc.in_features
-            model = nn.Sequential(*list(model.children())[:-1])
-        self.origin_feature = torch.nn.DataParallel(model)
-        self.model = args.model
-        self.arch = args.arch
+        self.source_gen = cycle_gan.define_G(3, 3, args.ngf, args.ngblocks,
+                                             args.norm, not args.no_dropout,
+                                             args.ngdownsampling)
+        self.target_gen = cycle_gan.define_G(3, 3, args.ngf, args.ngblocks,
+                                             args.norm, not args.no_dropout,
+                                             args.ngdownsampling)
+        self.source_discrim = cycle_gan.define_D(3, args.ndf, args.ndlayers,
+                                                 args.norm, args.no_lsgan)
+        self.target_discrim = cycle_gan.define_D(3, args.ndf, args.ndlayers,
+                                                 args.norm, args.no_lsgan)
 
-        self.fcb_s = nn.Linear(self.feature_dim, args.bottleneck)
-        self.fcb_s.weight.data.normal_(0, 0.005)
-        self.fcb_s.bias.data.fill_(0.1)
-        # self.fcb_t = nn.Linear(self.feature_dim, args.bottleneck)
-        # self.fcb_t.weight.data.normal_(0, 0.005)
-        # self.fcb_t.bias.data.fill_(0.1)
-        self.fcb_t = self.fcb_s
-        self.fc_s = nn.Linear(args.bottleneck, args.classes)
-        self.fc_s.weight.data.normal_(0, 0.01)
-        self.fc_s.bias.data.fill_(0.0)
-        # self.fc_t = nn.Linear(args.bottleneck, args.classes)
-        # self.fc_t.weight.data.normal_(0, 0.01)
-        # self.fc_t.bias.data.fill_(0.0)
-        self.fc_t = self.fc_s
+        self.saver = Saver(args.prefix, {
+            'G_s': self.source_gen,
+            'G_t': self.target_gen,
+            'D_s': self.source_discrim,
+            'D_t': self.target_discrim
+        })
+        self.fake_source_pool = ImagePool(args.pool_size)
+        self.fake_target_pool = ImagePool(args.pool_size)
 
-        self.W_st = create_W([args.bottleneck, args.bottleneck])
-        self.W_ts = create_W([args.bottleneck, args.bottleneck])
-
-        self.D_s = create_D([args.bottleneck, 1024, 1024, 1])
-        self.D_t = create_D([args.bottleneck, 1024, 1024, 1])
-
-        self.grl_ss = GRLayer()
-        self.grl_tt = GRLayer()
-        self.grl_st = GRLayer()
-        self.grl_ts = GRLayer()
-
-        args.SGD_param = [
-            {'params': self.origin_feature.parameters(), 'lr': 1,},
-            {
-                'params': itertools.chain(self.fcb_s.parameters(),
-                                          self.fcb_t.parameters()),
-                'lr': 10
-            },
-            {
-                'params': itertools.chain(self.fc_s.parameters(),
-                                          self.fc_t.parameters()),
-                'lr': 10
-            },
-            {
-                'params': itertools.chain(self.W_ts.parameters(),
-                                          self.W_st.parameters()),
-                'lr': 10
-            },
-            {
-                'params': itertools.chain(self.D_s.parameters(),
-                                          self.D_t.parameters()),
-                'lr': 10
-            }
-        ]
-
-    def forward(self, x, train=True):
-        x = self.origin_feature(x)
-        if self.arch.startswith('densenet'):
-            x = F.relu(x, inplace=True)
-            x = F.avg_pool2d(x, kernel_size=7)
-        x = x.view(x.size(0), -1)
-        x = torch.autograd.Variable(x.data)
-        if train:
-            orign_feature_s, orign_feature_t = x.chunk(2, 0)
-            feature_s = self.fcb_s(orign_feature_s)
-            feature_t = self.fcb_t(orign_feature_t)
-            output_s = self.fc_s(feature_s)
-            output_t = self.fc_t(feature_t)
-            fake_feature_t = self.W_st(feature_s)
-            fake_feature_s = self.W_ts(feature_t)
-            cycle_s = self.W_ts(fake_feature_t)
-            cycle_t = self.W_st(fake_feature_s)
-            fake_output_t = self.fc_t(fake_feature_t)
-            discriminate_s = self.D_s(torch.cat([self.grl_ss(fake_feature_s),
-                                                 self.grl_st(feature_s)], 0))
-            discriminate_t = self.D_t(torch.cat([self.grl_ts(fake_feature_t),
-                                                 self.grl_tt(feature_t)], 0))
-            return (feature_s, feature_t), \
-                   (cycle_s, cycle_t), \
-                   (output_s, output_t),\
-                   (fake_output_t,), \
-                   (discriminate_s, discriminate_t)
-        else:
-            return self.fc_t(self.fcb_t(x))
+        if args.continue_train:
+            self.saver.load('iter-%05d' % args.which_epoch)
 
 
-def L2loss(source, target):
-    return torch.sum((source - target) ** 2)
+def train_val(source_loader, target_loader, val_loader, model, optimizer, args):
 
-
-def train_val(source_loader, target_loader, val_loader, model, criterion, optimizer, args):
     batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
+    lossg = AverageMeter()
+    lossd = AverageMeter()
     top1 = AverageMeter()
 
-    source_cycle = itertools.cycle(source_loader)
-    target_cycle = itertools.cycle(target_loader)
+    source_cycle = infinite_loader(source_loader)
+    target_cycle = infinite_loader(target_loader)
+
+    criterionGAN = cycle_gan.GANLoss(use_lsgan=not args.no_lsgan)
+    criterionCycle = torch.nn.L1Loss()
+    criterionIdt = torch.nn.L1Loss()
+
+    optimizer_gen = torch.optim.Adam(
+        itertools.chain(model.source_gen.parameters(),
+                        model.target_gen.parameters()),
+        lr=args.lr, betas=(0.5, 0.999))
+    optimizer_discrim = torch.optim.Adam(
+        itertools.chain(model.source_discrim.parameters(),
+                        model.target_discrim.parameters()),
+        lr=args.lr, betas=(0.5, 0.999))
 
     end = time.time()
-    model.eval()
-    cycle_criterion = L2loss
-    discriminate_criterion = nn.BCELoss()
-    for i in range(args.train_iter):
-        global global_iter
-        global_iter = i
-        adjust_learning_rate(optimizer, i, args)
-        data_time.update(time.time() - end)
-        source_input, label = source_cycle.next()
-        if source_input.size()[0] < args.batch_size:
-            source_input, label = source_cycle.next()
-        target_input, _ = target_cycle.next()
-        if target_input.size()[0] < args.batch_size:
-            target_input, _ = target_cycle.next()
-        domain_label = torch.autograd.Variable(
-            torch.cat([torch.zeros(source_input.size()[0]),
-                       torch.ones(source_input.size()[0])], 0)).cuda()
-        label = label.cuda(async=True)
-        source_var = torch.autograd.Variable(source_input)
-        target_var = torch.autograd.Variable(target_input)
-        label_var = torch.autograd.Variable(label)
+    model.train()
+    with open(os.path.join(args.prefix, 'log.txt'), 'w') as f:
+        num_params =  get_network_parameters(model)
+        msg = 'Total number of parameters: %d (%.2fMB)' % \
+            (num_params, float(num_params) * 4 / 1024 / 1024)
+        print(msg)
+        f.write(msg + '\n')
+        for i in range(args.train_iter):
+            # adjust_learning_rate(optimizer, i, args)
 
-        inputs = torch.cat([source_var, target_var], 0)
-        (feature_s, feature_t), (cycle_s, cycle_t), \
-            (output_s, output_t), (fake_output_t,), \
-            (discriminate_s, discriminate_t) = model(inputs)
+            source_input, label = next(source_cycle)
+            target_input, _ = next(target_cycle)
 
-        acc_loss = criterion(output_s, label_var) \
-            + criterion(fake_output_t, label_var)
-        cycle_loss = cycle_criterion(feature_s, cycle_s) \
-            + cycle_criterion(feature_t, cycle_t)
-        discriminate_loss = discriminate_criterion(discriminate_s, domain_label) \
-            + discriminate_criterion(discriminate_t, domain_label)
+            real_source = Variable(source_input).cuda()
+            real_target = Variable(target_input).cuda()
+            source_label = Variable(label).cuda()
 
-        loss = acc_loss + args.alpha * cycle_loss + args.beta * discriminate_loss
-        # loss = discriminate_loss
+            # -------- Train GAN -------- #
+            if args.lambda_idt > 0:
+                idt_source = model.target_gen(real_source)
+                idt_target = model.source_gen(real_target)
+                loss_idt = criterionIdt(idt_source, real_source) * \
+                           args.lambda_s * args.lambda_idt + \
+                           criterionIdt(idt_target, real_target) * \
+                           args.lambda_t * args.lambda_idt
+            else:
+                loss_idt = 0
 
-        prec1, _ = accuracy(output_s.data, label, topk=(1, 5))
+            fake_target = model.source_gen(real_source)
+            fake_source = model.target_gen(real_target)
+            fake_target_pred = model.source_discrim(fake_target)
+            fake_source_pred = model.target_discrim(fake_source)
+            loss_gen = criterionGAN(fake_source_pred, True) + \
+                criterionGAN(fake_target_pred, True)
 
-        losses.update(loss.data[0], args.batch_size)
-        loss1 = acc_loss.data[0]
-        loss2 = cycle_loss.data[0]
-        loss3 = discriminate_loss.data[0]
-        top1.update(prec1[0], args.batch_size)
+            rec_target = model.source_gen(fake_source)
+            rec_source = model.target_gen(fake_target)
+            loss_rec = criterionCycle(rec_source, real_source) * args.lambda_s + \
+               criterionCycle(rec_target, real_target) * args.lambda_t
 
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+            loss_G = loss_idt + loss_rec + loss_gen
 
-        if i % args.print_freq == 0:
-            print('Iter: [{0}/{1}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Loss {loss1:.4f} {loss2:.4f} {loss3:.4f}\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                i, args.train_iter, batch_time=batch_time,
-                loss=losses, top1=top1, loss1=loss1, loss2=loss2, loss3=loss3))
+            optimizer_gen.zero_grad()
+            loss_G.backward()
+            optimizer_gen.step()
 
-        if i % args.test_iter == 0 and i != 0:
-            validate(val_loader, model, criterion, args)
-            model.eval()
-            batch_time.reset()
-            data_time.reset()
-            losses.reset()
-            top1.reset()
+            # -------- Train Discrim -------- #
+            origin_fake_target = fake_target
+            fake_target = model.fake_target_pool.query(fake_target).detach()
+            fake_source = model.fake_source_pool.query(fake_source).detach()
+
+            real_target_pred = model.source_discrim(real_target)
+            real_source_pred = model.target_discrim(real_source)
+            fake_target_pred = model.source_discrim(fake_target)
+            fake_source_pred = model.target_discrim(fake_source)
+
+            loss_D = (criterionGAN(real_source_pred, True) +
+                      criterionGAN(fake_source_pred, False)) * 0.5 + \
+                     (criterionGAN(real_target_pred, True) +
+                      criterionGAN(fake_target_pred, False)) * 0.5
+            optimizer_discrim.zero_grad()
+            loss_D.backward()
+            optimizer_discrim.step()
+
+            lossg.update(loss_G.data[0], args.batch_size)
+            lossd.update(loss_D.data[0], args.batch_size)
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                msg = 'Iter: [{0}/{1}]\t' \
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t' \
+                      'LossG {lossg.val:.4f}/{lossg.avg:.4f}\t' \
+                      'LossD {lossd.val:.4f} ({lossd.avg:.4f})\t' \
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                    i, args.train_iter, batch_time=batch_time,
+                    lossg=lossg, lossd=lossd, top1=top1)
+                print(msg)
+                f.write(msg + '\n')
+
+            if i % args.display_freq == 0:
+                dirname = os.path.join(args.prefix, 'iter-%05d' % i)
+                print_image(real_source, dirname, 'image-real_source-%03d.jpeg')
+                print_image(origin_fake_target, dirname,
+                            'image-fake_target-%03d.jpeg')
+                print_image(rec_source, dirname, 'image-rec_source-%03d.jpeg')
+
+            if i % args.save_epoch_freq == 0:
+                model.saver.save('iter-%05d' % i)
 
 
-def validate(val_loader, model, criterion, args):
-    batch_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-    top5 = AverageMeter()
-
-    # switch to evaluate mode
-    model.eval()
-
-    end = time.time()
-    for i, (input, target) in enumerate(val_loader):
-        target = target.cuda(async=True)
-        input_var = torch.autograd.Variable(input, volatile=True)
-        target_var = torch.autograd.Variable(target, volatile=True)
-
-        # compute output
-        output = model(input_var, train=False)
-        loss = criterion(output, target_var)
-
-        # measure accuracy and record loss
-        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
-        top5.update(prec5[0], input.size(0))
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-    print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
-          .format(top1=top1, top5=top5))
-
-    return top1.avg
+def print_image(input, dirname, filename):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+    for index, pic in enumerate(input.data.cpu()):
+        pic = pic.numpy()
+        pic = np.clip((pic * 0.5 + 0.5) * 255, 0.0, 255.0)
+        pic = np.rint(pic).astype(np.uint8).transpose(1, 2, 0)
+        Image.fromarray(pic, 'RGB').save(os.path.join(dirname, filename) % index)

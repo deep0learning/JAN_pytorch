@@ -104,3 +104,5 @@ src/*
 
 models/resnet50.pth
 .idea
+
+checkpoints
