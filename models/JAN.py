@@ -117,7 +117,7 @@ def train_val(source_loader, target_loader, val_loader, val_source_loader, model
         softmax = nn.Softmax()
         jmmd_loss = JMMDLoss([source_feature, softmax(source_output)], [target_feature, softmax(target_output)])
 
-        loss = acc_loss + 1.5 * jmmd_loss
+        loss = acc_loss + 0.3 * jmmd_loss
 
         prec1, _ = accuracy(source_output.data, label, topk=(1, 5))
 

@@ -116,9 +116,10 @@ def train_val(source_loader, target_loader, val_loader, val_source_loader, model
         acc_loss = criterion(source_output, label_var)
         softmax = nn.Softmax()
         jmmd_loss = JMMDLoss([source_feature, softmax(source_output)], 
-                             [target_feature, softmax(target_output)], b_test=True, graph_loss=.1)
+                             [target_feature, softmax(target_output)], b_test=False, 
+                             graph_loss=args.alpha if i > 5000 else 0)
 
-        loss = acc_loss + 1.5 * jmmd_loss
+        loss = acc_loss + 0.3 * jmmd_loss
 
         prec1, _ = accuracy(source_output.data, label, topk=(1, 5))
 
@@ -155,7 +156,7 @@ def train_val(source_loader, target_loader, val_loader, val_source_loader, model
             losses.reset()
             top1.reset()
             
-            np.save("results/JAN/JAN_%05d_savedata.npy"%i, {
+            np.save("results/JAN/JAN_%f_%05d_savedata.npy"%(args.alpha, i), {
                 't_fc7': t_fc7,
                 't_fc8': t_fc8,
                 't_label': t_label,
